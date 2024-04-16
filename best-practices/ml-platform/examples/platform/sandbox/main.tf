@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+locals {
+  # https://github.com/hashicorp/terraform-provider-google/issues/13325
+  connect_gateway_host_url = "https://connectgateway.googleapis.com/v1/projects/${data.google_project.environment.number}/locations/global/gkeMemberships/${module.gke.cluster_name}"
+}
+
 #
 # Project
 ##########################################################################
 data "google_project" "environment" {
   project_id = var.environment_project_id
+}
+
+resource "google_project_service" "compute_googleapis_com" {
+  disable_dependent_services = false
+  disable_on_destroy         = false
+  project                    = data.google_project.environment.project_id
+  service                    = "compute.googleapis.com"
 }
 
 resource "google_project_service" "containerfilesystem_googleapis_com" {
@@ -61,13 +73,6 @@ resource "google_project_service" "project_services-con" {
   service                    = "container.googleapis.com"
 }
 
-resource "google_project_service" "project_services-com" {
-  disable_dependent_services = false
-  disable_on_destroy         = false
-  project                    = data.google_project.environment.project_id
-  service                    = "compute.googleapis.com"
-}
-
 resource "google_project_service" "project_services-gkecon" {
   disable_dependent_services = false
   disable_on_destroy         = false
@@ -103,7 +108,7 @@ module "create-vpc" {
   source = "../../../terraform/modules/network"
 
   depends_on = [
-    google_project_service.project_services-com
+    google_project_service.compute_googleapis_com
   ]
 
   network_name     = format("%s-%s", var.network_name, var.environment_name)
@@ -133,10 +138,10 @@ module "cloud-nat" {
 ##########################################################################
 resource "google_gke_hub_feature" "configmanagement_acm_feature" {
   depends_on = [
+    google_project_service.compute_googleapis_com,
     google_project_service.project_services-gkeh,
     google_project_service.project_services-anc,
     google_project_service.project_services-an,
-    google_project_service.project_services-com,
     google_project_service.project_services-gkecon
   ]
 
@@ -150,21 +155,42 @@ module "gke" {
 
   depends_on = [
     google_gke_hub_feature.configmanagement_acm_feature,
-    google_project_service.project_services-con,
-    google_project_service.project_services-com
+    google_project_service.compute_googleapis_com,
+    google_project_service.project_services-con
   ]
 
   cluster_name                = format("%s-%s", var.cluster_name, var.environment_name)
   env                         = var.environment_name
   initial_node_count          = 1
-  machine_type                = "n2-standard-8"
+  machine_type                = "e2-standard-4"
   master_auth_networks_ipcidr = var.subnet_01_ip
   network                     = module.create-vpc.vpc
   project_id                  = data.google_project.environment.project_id
   region                      = var.subnet_01_region
-  remove_default_node_pool    = false
+  remove_default_node_pool    = true
   subnet                      = module.create-vpc.subnet-1
   zone                        = "${var.subnet_01_region}-a"
+}
+
+module "node_pool_system" {
+  source = "../../../terraform/modules/node-pools"
+
+  depends_on = [
+    module.gke
+  ]
+
+  autoscaling = {
+    location_policy      = "BALANCED"
+    total_max_node_count = 12
+    total_min_node_count = 3
+  }
+  cluster_name       = module.gke.cluster_name
+  initial_node_count = 3
+  location           = var.subnet_01_region
+  machine_type       = "e2-standard-4"
+  node_pool_name     = "system-cpu-e2s4"
+  project_id         = data.google_project.environment.project_id
+  resource_type      = "cpu"
 }
 
 module "node_pool_cpu_n2s8" {
@@ -277,6 +303,7 @@ resource "google_gke_hub_membership" "membership" {
 
 resource "google_gke_hub_feature_membership" "feature_member" {
   depends_on = [
+    github_branch.environment,
     google_project_service.project_services-gkecon,
     google_project_service.project_services-gkeh,
     google_project_service.project_services-an,
@@ -350,6 +377,11 @@ resource "github_branch_default" "environment" {
 #
 # Scripts
 ##########################################################################
+provider "kubernetes" {
+  host  = local.connect_gateway_host_url
+  token = data.google_client_config.default.access_token
+}
+
 resource "null_resource" "create_cluster_yamls" {
   depends_on = [
     google_gke_hub_feature_membership.feature_member
@@ -373,7 +405,7 @@ resource "null_resource" "create_git_cred_cms" {
     google_gke_hub_feature_membership.feature_member,
     module.cloud-nat,
     module.gke,
-    module.node_pool_cpu_n2s8
+    #module.node_pool_cpu_n2s8
   ]
 
   provisioner "local-exec" {
@@ -441,9 +473,27 @@ resource "null_resource" "create_namespace" {
     }
   }
 
+  provisioner "local-exec" {
+    command = "scripts/namespace_cleanup.sh"
+    environment = {
+      GIT_EMAIL      = self.triggers.github_email
+      GIT_REPOSITORY = self.triggers.git_repository
+      GIT_TOKEN      = self.triggers.github_token
+      GIT_USERNAME   = self.triggers.github_user
+      K8S_NAMESPACE  = self.triggers.namespace
+    }
+    when        = destroy
+    working_dir = path.module
+  }
+
   triggers = {
-    md5_files  = md5(join("", [for f in fileset("${path.module}/templates/acm-template/templates/_cluster_template/team", "**") : md5("${path.module}/templates/acm-template/templates/_cluster_template/team/${f}")]))
-    md5_script = filemd5("${path.module}/scripts/create_namespace.sh")
+    git_repository = github_repository.acm_repo.full_name
+    github_email   = var.github_email
+    github_token   = var.github_token
+    github_user    = var.github_user
+    md5_files      = md5(join("", [for f in fileset("${path.module}/templates/acm-template/templates/_cluster_template/team", "**") : md5("${path.module}/templates/acm-template/templates/_cluster_template/team/${f}")]))
+    md5_script     = filemd5("${path.module}/scripts/create_namespace.sh")
+    namespace      = var.namespace
   }
 }
 
